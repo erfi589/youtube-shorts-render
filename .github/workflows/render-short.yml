@@ -1,0 +1,58 @@
+name: Render Short
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Render job id
+        required: true
+        type: string
+      release_id:
+        description: Draft release that holds the job assets
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: render-short
+  cancel-in-progress: false
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JOB: ${{ inputs.job_id }}
+      RID: ${{ inputs.release_id }}
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core jq
+      - name: Download job assets from the private draft release
+        run: |
+          set -euo pipefail
+          case "$RID" in *[!0-9]*|"") echo "Invalid release id"; exit 1;; esac
+          mkdir -p work
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/releases/$RID/assets?per_page=100" -o assets.json
+          jq -r ".[] | [.id, .name] | @tsv" assets.json > list.tsv
+          while read -r id name; do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" "https://api.github.com/repos/$REPO/releases/assets/$id" -o "work/$name"
+          done < list.tsv
+          test -f work/manifest.json
+      - name: Render video
+        working-directory: work
+        run: |
+          set -euo pipefail
+          n=$(jq ".scenes | length" manifest.json)
+          : > list.txt
+          for i in $(seq 0 $((n-1))); do
+            f=$(jq -r ".scenes[$i].image" manifest.json)
+            fr=$(jq -r ".scenes[$i].frames" manifest.json)
+            ffmpeg -hide_banner -loglevel error -y -i "$f" -filter_complex "$(jq -r ".scenes[$i].filter" manifest.json)" -map "[v]" -frames:v "$fr" -r 30 -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "seg_$i.mp4"
+            echo "file seg_$i.mp4" >> list.txt
+          done
+          ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i list.txt -c copy video.mp4
+          ffmpeg -hide_banner -loglevel error -y -i video.mp4 -i audio.wav -vf "$(jq -r ".final_filter" manifest.json)" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p -c:a aac -b:a 128k -shortest -movflags +faststart output.mp4
+          ls -la output.mp4
+      - name: Attach video to the private draft release (no git commit)
+        run: |
+          curl -fsS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: video/mp4" --data-binary @work/output.mp4 "https://uploads.github.com/repos/$REPO/releases/$RID/assets?name=output.mp4" -o /dev/null
