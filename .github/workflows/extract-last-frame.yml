@@ -1,0 +1,94 @@
+name: extract-last-frame
+run-name: "extract-last-frame ${{ inputs.job_id }} ${{ inputs.output_name }}"
+
+# Extracts the LAST frame of one Wan clip that is already stored in a DRAFT release
+# and uploads it to the same draft release as a JPEG. Never overwrites, never touches git history.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Cartoon job id"
+        required: true
+      release_id:
+        description: "Draft release id that stores the clip"
+        required: true
+      clip_asset_id:
+        description: "Release asset id of the source clip (mp4)"
+        required: true
+      clip_sha256:
+        description: "Expected SHA-256 of the source clip"
+        required: true
+      output_name:
+        description: "Name of the JPEG to upload (e.g. lastframe_s1_a1.jpg)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-last-frame-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      CLIP_ASSET_ID: ${{ inputs.clip_asset_id }}
+      CLIP_SHA256: ${{ inputs.clip_sha256 }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || { echo "bad release_id"; exit 1; }
+          [[ "$CLIP_ASSET_ID" =~ ^[0-9]+$ ]] || { echo "bad clip_asset_id"; exit 1; }
+          [[ "$CLIP_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "bad clip_sha256"; exit 1; }
+          [[ "$OUTPUT_NAME" =~ ^lastframe_s[1-3]_a[0-9]+\.jpg$ ]] || { echo "bad output_name"; exit 1; }
+
+      - name: Check release is a draft and output name is free
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/releases/$RELEASE_ID" > rel.json
+          [ "$(jq -r '.draft' rel.json)" = "true" ] || { echo "release $RELEASE_ID is not a draft; refusing"; exit 1; }
+          if jq -e --arg n "$OUTPUT_NAME" '.assets[] | select(.name == $n)' rel.json > /dev/null; then
+            echo "$OUTPUT_NAME already exists in release $RELEASE_ID; not overwriting"; exit 1
+          fi
+          jq -e --argjson id "$CLIP_ASSET_ID" '.assets[] | select(.id == $id)' rel.json > /dev/null || { echo "clip asset $CLIP_ASSET_ID is not in release $RELEASE_ID"; exit 1; }
+
+      - name: Ensure ffmpeg
+        run: |
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+          ffmpeg -version | head -1
+
+      - name: Download clip and verify SHA-256
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/$REPO/releases/assets/$CLIP_ASSET_ID" -o clip.mp4
+          got=$(sha256sum clip.mp4 | cut -d' ' -f1)
+          [ "$got" = "$CLIP_SHA256" ] || { echo "clip sha256 $got != $CLIP_SHA256"; exit 1; }
+
+      - name: Extract last frame
+        run: |
+          set -euo pipefail
+          ffmpeg -hide_banner -loglevel error -sseof -1 -i clip.mp4 -an -q:v 2 -update 1 -y last.jpg
+          [ -s last.jpg ] || { echo "no frame extracted"; exit 1; }
+          size=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x last.jpg)
+          echo "frame size: $size"
+          [ "$size" = "480x832" ] || { echo "unexpected frame size $size (expected 480x832)"; exit 1; }
+          sha256sum last.jpg
+
+      - name: Upload frame to the draft release (no overwrite)
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o up.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "Content-Type: image/jpeg" \
+            --data-binary @last.jpg \
+            "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$OUTPUT_NAME")
+          cat up.json
+          [ "$code" = "201" ] || { echo "upload failed with HTTP $code"; exit 1; }
+          [ "$(jq -r '.size' up.json)" = "$(stat -c%s last.jpg)" ] || { echo "uploaded size mismatch"; exit 1; }
